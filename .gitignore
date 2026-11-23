@@ -1,0 +1,14 @@
+# Local dependency checkout and Python environment
+/metadrive/
+/.venv/
+__pycache__/
+*.py[cod]
+
+# Editor settings and generated simulation results
+/.idea/
+/demo_outputs/
+
+# Local shortcuts and planning documents
+*.lnk
+~$*
+/outline_reviewed.docx
