@@ -1,4 +1,6 @@
-# Autonomous Driving with MetaDrive and SUMO
+# autonomous-driving-agent
+
+Autonomous driving experiments with MetaDrive and SUMO.
 
 An ELG 5255 project exploring driving decisions in simulation. The current code
 contains rule-based driving demos, evaluation of MetaDrive's pretrained PPO
