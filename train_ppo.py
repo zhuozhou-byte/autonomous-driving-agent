@@ -1,6 +1,8 @@
 from collections import deque
 from datetime import datetime
 from functools import partial
+import hashlib
+import json
 import logging
 from pathlib import Path
 import sys
@@ -11,6 +13,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 # Run mode
 RUN_MODE = 'evaluate'
 RESUME_MODEL = PROJECT_DIR / 'models' / 'ppo_curve.zip'
+RESULTS_PATH = PROJECT_DIR / 'results' / 'ppo_curve.json'
 
 # Training
 TOTAL_TIMESTEPS = 100_000
@@ -52,6 +55,10 @@ VALUE_COEFFICIENT = 0.5
 MAX_GRAD_NORM = 0.5
 POLICY_LAYERS = (128, 128)
 VALUE_LAYERS = (128, 128)
+STEERING_LAYERS = (128, 128)
+SPEED_LAYERS = (128, 128)
+HIDDEN_INITIALIZATION_GAIN = 2 ** 0.5
+ACTION_INITIALIZATION_GAIN = 0.01
 USE_SDE = True
 SDE_SAMPLE_FREQ = 4
 LOG_STD_INIT = -2.0
@@ -63,7 +70,12 @@ DEVICE = 'cpu'
 CPU_THREADS = 1
 PROGRESS_INTERVAL = 10_000
 RECENT_EPISODES = 100
+PPO_VERBOSE = 0
+MIN_ELAPSED_SECONDS = 0.001
+SEED_UPPER_BOUND = 2 ** 32
+PERCENT_SCALE = 100
 OUTPUT_DIR = PROJECT_DIR / 'demo_outputs' / 'ppo_training'
+COLLISION_KEYS = ('crash_vehicle', 'crash_object', 'crash_building', 'crash_human')
 
 
 # Package imports
@@ -83,9 +95,6 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.vec_env import SubprocVecEnv
-
-COLLISION_KEYS = ('crash_vehicle', 'crash_object', 'crash_building', 'crash_human')
-
 
 # Policy networks
 class DrivingActionNetwork(torch.nn.Module):
@@ -108,16 +117,17 @@ class DrivingActionNetwork(torch.nn.Module):
         self.steering.requires_grad_(False)
         for layer in self.speed:
             if isinstance(layer, torch.nn.Linear):
-                torch.nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                torch.nn.init.orthogonal_(layer.weight, gain=HIDDEN_INITIALIZATION_GAIN)
                 torch.nn.init.zeros_(layer.bias)
-        torch.nn.init.orthogonal_(self.speed[-1].weight, gain=0.01)
+        torch.nn.init.orthogonal_(self.speed[-1].weight, gain=ACTION_INITIALIZATION_GAIN)
 
     def forward(self, features):
         return torch.cat((self.steering(features), self.speed(features[:, :self.speed_input_size])), dim=1)
 
 
 class IndependentSpeedPolicy(ActorCriticPolicy):
-    def __init__(self, *args, steering_layers=(128, 128), speed_layers=(128, 128), speed_input_size=None, **kwargs):
+    def __init__(self, *args, steering_layers=STEERING_LAYERS, speed_layers=SPEED_LAYERS,
+                 speed_input_size=None, **kwargs):
         self.steering_layers = tuple(steering_layers)
         self.speed_layers = tuple(speed_layers)
         self.speed_input_size = speed_input_size
@@ -156,7 +166,7 @@ def validate_settings():
         if not isinstance(value, int) or value <= 0:
             raise ValueError(f'{name} must be a positive integer.')
     for value in (TRAIN_START_SEED, VALIDATION_START_SEED, TEST_START_SEED, RANDOM_SEED):
-        if not isinstance(value, int) or not 0 <= value < 2**32:
+        if not isinstance(value, int) or not 0 <= value < SEED_UPPER_BOUND:
             raise ValueError('Seeds must be integers in [0, 2**32).')
     if not 0 <= TRAIN_FOCUS_PROBABILITY <= 1:
         raise ValueError('TRAIN_FOCUS_PROBABILITY must be between 0 and 1.')
@@ -184,7 +194,7 @@ def validate_settings():
         ('Test', TEST_START_SEED, TEST_MAP_COUNT),
     )
     for index, (name, first, count) in enumerate(ranges):
-        if first + count > 2**32:
+        if first + count > SEED_UPPER_BOUND:
             raise ValueError(f'{name} seeds must be below 2**32.')
         for other, other_first, other_count in ranges[index + 1:]:
             if max(first, other_first) < min(first + count, other_first + other_count):
@@ -344,7 +354,7 @@ class TrainingProgress(BaseCallback):
                 f'Train +{added_steps:>7,}/{TOTAL_TIMESTEPS:,} steps | total {self.num_timesteps:,} | '
                 f'episodes {self.episodes} | recent success {success:.0%} | '
                 f'recent training return {mean_return:+.1f} | '
-                f'{added_steps / max(elapsed, 0.001):.0f} steps/s',
+                f'{added_steps / max(elapsed, MIN_ELAPSED_SECONDS):.0f} steps/s',
                 flush=True,
             )
         if added_steps % VALIDATION_INTERVAL == 0:
@@ -355,7 +365,6 @@ class TrainingProgress(BaseCallback):
         return True
 
     def _on_training_end(self):
-        # Final gradient update
         self.validate_and_save()
 
 
@@ -400,7 +409,7 @@ def ppo_settings():
         clip_range=CLIP_RANGE, ent_coef=ENTROPY_COEFFICIENT,
         vf_coef=VALUE_COEFFICIENT, max_grad_norm=MAX_GRAD_NORM,
         use_sde=USE_SDE, sde_sample_freq=SDE_SAMPLE_FREQ, target_kl=TARGET_KL,
-        seed=RANDOM_SEED, verbose=0,
+        seed=RANDOM_SEED, verbose=PPO_VERBOSE,
     )
 
 
@@ -542,16 +551,57 @@ def evaluate(model, title='Saved PPO evaluation'):
             )
     finally:
         env.close()
-    passed = sum(row['success'] for row in results)
-    print(f'\nSuccess: {passed}/{len(results)} ({passed / len(results):.1%})')
-    print(f"Collision rate: {np.mean([row['collision'] for row in results]):.1%}")
-    print(f"Out-of-road rate: {np.mean([row['out_of_road'] for row in results]):.1%}")
-    print(f"Mean route completion: {np.mean([row['route'] for row in results]):.1%}")
-    print(f"Mean total reward: {np.mean([row['reward'] for row in results]):+.2f}")
-    times = [row['seconds'] for row in results if row['success']]
-    average_time = f'{np.mean(times):.1f} s' if times else 'N/A'
+    summary = evaluation_summary(results)
+    count = summary['episodes']
+    print(f"\nSuccess: {summary['successes']}/{count} ({summary['success_rate']:.1%})")
+    print(f"Collision rate: {summary['collisions'] / count:.1%}")
+    print(f"Out-of-road rate: {summary['out_of_road'] / count:.1%}")
+    print(f"Mean route completion: {summary['mean_route_completion']:.1%}")
+    print(f"Mean total reward: {summary['mean_reward']:+.2f}")
+    seconds = summary['mean_success_seconds']
+    average_time = 'N/A' if seconds is None else f'{seconds:.1f} s'
     print(f'Mean travel time, successful episodes: {average_time}')
     return results
+
+
+def evaluation_summary(rows):
+    if not rows:
+        raise ValueError('Evaluation results must not be empty.')
+    successes = sum(bool(row['success']) for row in rows)
+    times = [row['seconds'] for row in rows if row['success']]
+    return dict(
+        episodes=len(rows), successes=successes, success_rate=successes / len(rows),
+        collisions=sum(bool(row['collision']) for row in rows),
+        out_of_road=sum(bool(row['out_of_road']) for row in rows),
+        mean_route_completion=float(np.mean([row['route'] for row in rows])),
+        mean_reward=float(np.mean([row['reward'] for row in rows])),
+        mean_success_seconds=float(np.mean(times)) if times else None,
+    )
+
+
+# Result export
+def save_results(model, model_path, rows):
+    model_path = Path(model_path).resolve()
+    try:
+        model_file = model_path.relative_to(PROJECT_DIR.resolve()).as_posix()
+    except ValueError:
+        model_file = model_path.as_posix()
+    episodes = [
+        {key: value.item() if isinstance(value, np.generic) else value for key, value in row.items()}
+        for row in rows
+    ]
+    result = dict(
+        model=dict(file=model_file, sha256=hashlib.sha256(model_path.read_bytes()).hexdigest(),
+                   num_timesteps=int(model.num_timesteps)),
+        evaluation=dict(map_layout=MAP_LAYOUT, traffic_density=TRAFFIC_DENSITY,
+                        seeds=[int(row['seed']) for row in episodes], deterministic=True,
+                        reward='metadrive_default', max_episode_steps=MAX_EPISODE_STEPS,
+                        random_spawn_lane=RANDOM_SPAWN_LANE),
+        summary=evaluation_summary(episodes), episodes=episodes,
+    )
+    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RESULTS_PATH.write_text(json.dumps(result, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+    print(f'Results: {RESULTS_PATH}')
 
 
 def compare_results(before, after):
@@ -560,9 +610,9 @@ def compare_results(before, after):
     print(f'\nPPO comparison on the same {len(after)} test maps')
     print(f"{'Metric':<25} {'Before':>12} {'After':>12} {'Change':>12}")
     for label, key, scale, unit in (
-        ('Success rate', 'success', 100, '%'),
-        ('Out-of-road rate', 'out_of_road', 100, '%'),
-        ('Mean route completion', 'route', 100, '%'),
+        ('Success rate', 'success', PERCENT_SCALE, '%'),
+        ('Out-of-road rate', 'out_of_road', PERCENT_SCALE, '%'),
+        ('Mean route completion', 'route', PERCENT_SCALE, '%'),
         ('Mean total reward', 'reward', 1, ''),
     ):
         old_value = float(np.mean([row[key] for row in before])) * scale
@@ -580,7 +630,9 @@ def main():
     validate_settings()
     torch.set_num_threads(CPU_THREADS)
     if RUN_MODE == 'evaluate':
-        evaluate(PPO.load(RESUME_MODEL, device=DEVICE))
+        model = PPO.load(RESUME_MODEL, device=DEVICE)
+        rows = evaluate(model)
+        save_results(model, RESUME_MODEL, rows)
         return 0
     model_path = train()
     if model_path is None:
@@ -592,6 +644,7 @@ def main():
         del baseline
     model = PPO.load(model_path, device=DEVICE)
     after = evaluate(model, 'Best PPO')
+    save_results(model, model_path, after)
     if before is not None:
         compare_results(before, after)
     return 0

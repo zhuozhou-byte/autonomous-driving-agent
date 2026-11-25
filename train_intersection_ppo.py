@@ -1,4 +1,6 @@
 from collections import deque
+import hashlib
+import json
 import logging
 from pathlib import Path
 import sys
@@ -6,10 +8,11 @@ import tempfile
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
-# Run settings
+# Run
 RUN_MODE = 'evaluate'
 RESUME_TRAINING = True
 MODEL_PATH = PROJECT_DIR / 'models' / 'ppo_yellow.zip'
+RESULTS_PATH = PROJECT_DIR / 'results' / 'ppo_yellow.json'
 RESUME_MODEL = None
 TRAINING_STAGES = (('green', 60_000), ('red_start', 100_000), ('signals', 102_400))
 VALIDATION_INTERVAL = 20_480
@@ -19,12 +22,23 @@ STAGE_SUCCESS_TARGET = 1.0
 RENDER_EVALUATION = False
 RANDOM_SEED = 42
 
-# Intersection and episodes
+# Road
 MAP_SEED = 0
+MAP_LAYOUT = 'X'
+MAP_SCENARIOS = 1
+LANE_COUNT = 1
+SPAWN_LANE_INDEX = 0
+DESTINATION_NODE = (1, 1, 1)
+TRAFFIC_DENSITY = 0.0
+ACCIDENT_PROBABILITY = 0.0
+LIDAR_RAYS = 0
 APPROACH_LENGTH_M = 70.0
 LANE_WIDTH_M = 3.5
+LANE_EDGE_TOLERANCE_M = 0.05
 STOP_LINE_MARGIN_M = 2.0
-START_DISTANCE_M = (20.0, 45.0)  # Vehicle center to stop line
+GOAL_MARGIN_M = 5.0
+START_CLEARANCE_M = 5.0
+START_DISTANCE_M = (20.0, 45.0)
 START_SPEED_KMH = (0.0, 20.0)
 MAX_SPEED_KMH = 40.0
 RED_SECONDS = 8.0
@@ -35,6 +49,8 @@ PHYSICS_DT = 0.02
 DECISION_REPEAT = 5
 WAIT_ZONE_M = 6.0
 STOPPED_SPEED_KMH = 1.0
+
+# Scenarios
 TRAIN_START_SEED = 0
 TRAIN_SCENARIOS = 1_000
 TRAIN_FOCUS_SEEDS = ()
@@ -56,6 +72,7 @@ APPROACH_SPEED_PENALTY = 2.0
 BRAKING_RISK_PENALTY = 2.0
 BRAKING_DECELERATION = 3.0
 BRAKING_MARGIN_M = 1.0
+BRAKING_MIN_SPEED_MPS = 0.1
 SPEED_TOLERANCE_KMH = 2.0
 MAX_APPROACH_OVERSPEED_FRACTION = 0.05
 
@@ -78,8 +95,19 @@ POLICY_LAYERS = (128, 128)
 DEVICE = 'cpu'
 CPU_THREADS = 1
 PROGRESS_INTERVAL = 10_000
+RECENT_EPISODES = 100
+VALIDATION_LOG_INTERVAL = 50
 
-# Package imports
+# Display and units
+STOP_LINE_COLOR = (1, 1, 1, 1)
+STOP_LINE_WIDTH = 4
+STOP_LINE_HEIGHT_M = 0.05
+REWARD_COLUMN_WIDTH = 40
+REWARD_TABLE_WIDTH = 67
+KMH_PER_MPS = 3.6
+ACTION_SIZE = 2
+
+# Dependencies
 _original_path = sys.path.copy()
 sys.path[:] = [p for p in sys.path if Path(p or '.').resolve() != PROJECT_DIR]
 try:
@@ -107,7 +135,7 @@ COLLISION_KEYS = ('crash_vehicle', 'crash_object', 'crash_building', 'crash_huma
 TASK_VERSION = 'signal_intersection_v3'
 
 
-# Configuration checks
+# Checks
 def validate_settings():
     if RUN_MODE not in ('train', 'evaluate'):
         raise ValueError("RUN_MODE must be 'train' or 'evaluate'.")
@@ -120,7 +148,7 @@ def validate_settings():
     if EPISODE_SECONDS < 2 * (RED_SECONDS + GREEN_SECONDS + YELLOW_SECONDS):
         raise ValueError('Allow at least two signal cycles per episode.')
     approach = APPROACH_LENGTH_M - FirstPGBlock.ENTRANCE_LENGTH - STOP_LINE_MARGIN_M
-    if not 5 < START_DISTANCE_M[0] <= START_DISTANCE_M[1] < approach:
+    if not START_CLEARANCE_M < START_DISTANCE_M[0] <= START_DISTANCE_M[1] < approach:
         raise ValueError('Starting distances must fit before the intersection stop line.')
     if not 0 <= START_SPEED_KMH[0] <= START_SPEED_KMH[1] <= MAX_SPEED_KMH:
         raise ValueError('Invalid starting speed range.')
@@ -152,24 +180,24 @@ def environment_config(render=False):
         agent_policy=EnvInputPolicy,
         agent_observation=StateObservation,
         manual_control=False,
-        traffic_density=0.0,
-        accident_prob=0.0,
+        traffic_density=TRAFFIC_DENSITY,
+        accident_prob=ACCIDENT_PROBABILITY,
         random_spawn_lane_index=False,
         start_seed=MAP_SEED,
-        num_scenarios=1,
+        num_scenarios=MAP_SCENARIOS,
         map_config=dict(
-            type='block_sequence', config='X', lane_num=1,
+            type='block_sequence', config=MAP_LAYOUT, lane_num=LANE_COUNT,
             lane_width=LANE_WIDTH_M, exit_length=APPROACH_LENGTH_M,
         ),
         agent_configs={'default_agent': dict(
-            spawn_lane_index=(FirstPGBlock.NODE_2, FirstPGBlock.NODE_3, 0),
-            destination=InterSection.node(1, 1, 1),
+            spawn_lane_index=(FirstPGBlock.NODE_2, FirstPGBlock.NODE_3, SPAWN_LANE_INDEX),
+            destination=InterSection.node(*DESTINATION_NODE),
             spawn_velocity_car_frame=True,
             max_speed_km_h=MAX_SPEED_KMH,
         )},
         vehicle_config=dict(
             enable_reverse=False,
-            lidar=dict(num_lasers=0), show_navi_mark=False, show_dest_mark=True,
+            lidar=dict(num_lasers=LIDAR_RAYS), show_navi_mark=False, show_dest_mark=True,
         ),
         physics_world_step_size=PHYSICS_DT,
         decision_repeat=DECISION_REPEAT,
@@ -179,7 +207,7 @@ def environment_config(render=False):
     )
 
 
-# Transition rewards
+# Rewards
 def transition_reward(delta_progress, dt, waiting, collision, red_violation, off_road, success, timeout,
                       approach_risk=0.0, braking_risk=0.0):
     events = (
@@ -201,15 +229,15 @@ def driving_risks(distance, speed, color, remaining, dt):
     if distance < 0:
         return 0.0, 0.0
     speed = max(0.0, speed)
-    target = APPROACH_SPEED_KMH / 3.6
+    target = APPROACH_SPEED_KMH / KMH_PER_MPS
     approach = (max(0.0, speed - target) / target) ** 2 if distance <= APPROACH_DISTANCE_M else 0.0
     must_stop = color == 'red' or (color == 'yellow' and distance >= speed * remaining)
     required = BRAKING_MARGIN_M + speed * dt + speed ** 2 / (2 * BRAKING_DECELERATION)
-    braking = float(np.clip((required - distance) / required, 0, 1)) if must_stop and speed > 0.1 else 0.0
+    braking = float(np.clip((required - distance) / required, 0, 1)) if must_stop and speed > BRAKING_MIN_SPEED_MPS else 0.0
     return approach, braking
 
 
-# Signal-controlled driving
+# Environment
 class SignalIntersectionEnv(gym.Wrapper):
     def __init__(self, render=False, training=False, stage='signals'):
         if stage not in ('green', 'red_start', 'signals'):
@@ -248,7 +276,7 @@ class SignalIntersectionEnv(gym.Wrapper):
         agent['spawn_longitude'] = (
             APPROACH_LENGTH_M - FirstPGBlock.ENTRANCE_LENGTH - STOP_LINE_MARGIN_M - distance
         )
-        agent['spawn_velocity'] = (speed / 3.6, 0.0)
+        agent['spawn_velocity'] = (speed / KMH_PER_MPS, 0.0)
         self.env.reset(seed=MAP_SEED)
         self.approach_lane = self.env.current_map.road_network.get_lane(agent['spawn_lane_index'])
         self.origin = np.asarray(self.approach_lane.position(0, 0))
@@ -256,7 +284,7 @@ class SignalIntersectionEnv(gym.Wrapper):
         self.side = np.array([-self.direction[1], self.direction[0]])
         self.stop_s = self.approach_lane.length - STOP_LINE_MARGIN_M
         final_lane = self.env.vehicle.navigation.final_lane
-        goal = np.asarray(final_lane.position(final_lane.length - 5.0, 0))
+        goal = np.asarray(final_lane.position(final_lane.length - GOAL_MARGIN_M, 0))
         self.goal_s = float((goal - self.origin) @ self.direction)
         self.start_s = self._position()[0]
         self.route_length = self.goal_s - self.start_s
@@ -267,7 +295,7 @@ class SignalIntersectionEnv(gym.Wrapper):
         self.approach_overspeed_steps = 0
         self.approach_peak_speed = 0.0
         self.entry_speed = None
-        self.last_action = np.zeros(2)
+        self.last_action = np.zeros(ACTION_SIZE)
         self.finished = False
         self.light = self.env.engine.spawn_object(
             BaseTrafficLight, lane=self.approach_lane,
@@ -323,7 +351,7 @@ class SignalIntersectionEnv(gym.Wrapper):
         velocity = np.asarray(self.env.vehicle.velocity)
         heading = np.asarray(self.env.vehicle.heading)
         color, remaining = self.signal_state()
-        scale = MAX_SPEED_KMH / 3.6
+        scale = MAX_SPEED_KMH / KMH_PER_MPS
         observation = [
             velocity @ self.direction / scale, velocity @ self.side / scale,
             lateral / (LANE_WIDTH_M / 2), heading @ self.side, heading @ self.direction,
@@ -337,7 +365,7 @@ class SignalIntersectionEnv(gym.Wrapper):
         if self.finished:
             raise RuntimeError('Reset the environment before stepping a finished episode.')
         action = np.asarray(action, dtype=np.float32)
-        if action.shape != (2,) or not np.isfinite(action).all():
+        if action.shape != (ACTION_SIZE,) or not np.isfinite(action).all():
             raise ValueError('Actions must contain finite steering and throttle/brake values.')
         self.last_action = np.clip(action, -1, 1)
         color_during_step, remaining = self.signal_state()
@@ -347,10 +375,10 @@ class SignalIntersectionEnv(gym.Wrapper):
         speed = max(0.0, float(np.asarray(self.env.vehicle.velocity) @ self.direction))
         approach_risk, braking_risk = driving_risks(previous_distance, speed, color_during_step, remaining, self.dt)
         if 0 <= previous_distance <= APPROACH_DISTANCE_M:
-            if speed * 3.6 > STOPPED_SPEED_KMH:
+            if speed * KMH_PER_MPS > STOPPED_SPEED_KMH:
                 self.approach_steps += 1
-                self.approach_overspeed_steps += int(speed * 3.6 > APPROACH_SPEED_KMH + SPEED_TOLERANCE_KMH)
-            self.approach_peak_speed = max(self.approach_peak_speed, speed * 3.6)
+                self.approach_overspeed_steps += int(speed * KMH_PER_MPS > APPROACH_SPEED_KMH + SPEED_TOLERANCE_KMH)
+            self.approach_peak_speed = max(self.approach_peak_speed, speed * KMH_PER_MPS)
         _, _, _, _, native_info = self.env.step(self.last_action)
         self.steps += 1
         current_distance = self.stop_distance()
@@ -360,9 +388,9 @@ class SignalIntersectionEnv(gym.Wrapper):
         red_violation = bool(color_during_step == 'red' and crossed)
         collision = any(bool(native_info.get(key, False)) for key in COLLISION_KEYS)
         s, lateral = self._position()
-        # Assigned straight lane corridor
+        # Lane boundary
         off_road = bool(native_info.get('out_of_road', False)
-                        or abs(lateral) + self._footprint()[1] > LANE_WIDTH_M / 2 + 0.05)
+                        or abs(lateral) + self._footprint()[1] > LANE_WIDTH_M / 2 + LANE_EDGE_TOLERANCE_M)
         success = bool(s >= self.goal_s and not (collision or red_violation or off_road))
         timeout = self.steps >= self.max_steps and not (success or collision or red_violation or off_road)
         reward, reason = transition_reward(
@@ -401,11 +429,11 @@ class SignalIntersectionEnv(gym.Wrapper):
     def _draw_stop_line(self):
         from panda3d.core import LineSegs
         line = LineSegs()
-        line.setColor(1, 1, 1, 1)
-        line.setThickness(4)
+        line.setColor(*STOP_LINE_COLOR)
+        line.setThickness(STOP_LINE_WIDTH)
         for method, lateral in ((line.moveTo, -LANE_WIDTH_M / 2), (line.drawTo, LANE_WIDTH_M / 2)):
             x, y = self.approach_lane.position(self.stop_s, lateral)
-            method(float(x), float(y), 0.05)
+            method(float(x), float(y), STOP_LINE_HEIGHT_M)
         self.stop_line_node = self.env.engine.worldNP.attachNewNode(line.create())
 
     def render(self):
@@ -429,7 +457,7 @@ class SignalIntersectionEnv(gym.Wrapper):
         self.env.close()
 
 
-# Terminal output
+# Output
 def print_reward_table():
     rows = (
         ('Route progress', f'{PROGRESS_REWARD:g} * progress change'),
@@ -444,17 +472,17 @@ def print_reward_table():
         ('Task deadline', f'-{TIMEOUT_PENALTY:g}'),
     )
     print('\nSignal Intersection Reward')
-    print(f"{'Component':<40} Value")
-    print('-' * 67)
+    print(f"{'Component':<{REWARD_COLUMN_WIDTH}} Value")
+    print('-' * REWARD_TABLE_WIDTH)
     for component, value in rows:
-        print(f'{component:<40} {value}')
+        print(f'{component:<{REWARD_COLUMN_WIDTH}} {value}')
 
 
 class TrainingProgress(BaseCallback):
     def __init__(self, stage):
         super().__init__()
         self.stage = stage
-        self.episodes = deque(maxlen=100)
+        self.episodes = deque(maxlen=RECENT_EPISODES)
 
     def _on_step(self):
         for done, info in zip(self.locals['dones'], self.locals['infos']):
@@ -472,7 +500,7 @@ class TrainingProgress(BaseCallback):
         return True
 
 
-# Checkpoint settings
+# Checkpoints
 def task_settings():
     return dict(
         version=TASK_VERSION, observations=list(OBSERVATION_NAMES),
@@ -532,7 +560,7 @@ def load_model(env=None, stage='signals', for_training=False, path=None):
     return model
 
 
-# Yellow observation transfer
+# Observation transfer
 def transfer_yellow_policy(source, stage):
     previous = source.intersection_settings
     current = task_settings()
@@ -566,19 +594,47 @@ def transfer_yellow_policy(source, stage):
     return model
 
 
-# Validation ranking
+# Metrics
+def summarize_results(rows):
+    if not rows:
+        raise ValueError('Evaluation results must not be empty.')
+    successful = [row for row in rows if row['is_success']]
+    times = [row['seconds'] for row in successful]
+    entries = [row['entry_speed_kmh'] for row in successful if row['entry_speed_kmh'] is not None]
+    return dict(
+        episodes=len(rows), successes=len(successful), success_rate=len(successful) / len(rows),
+        red_light_violations=sum(row['red_light_violation'] for row in rows),
+        collisions=sum(row['collision'] for row in rows),
+        out_of_road=sum(row['out_of_road'] for row in rows),
+        timeouts=sum(row['timeout'] for row in rows),
+        unsafe_episodes=sum(row['red_light_violation'] or row['collision'] or row['out_of_road'] for row in rows),
+        mean_route_completion=float(np.mean([row['route_completion'] for row in rows])),
+        mean_reward=float(np.mean([row['episode_reward'] for row in rows])),
+        mean_success_seconds=float(np.mean(times)) if times else None,
+        mean_success_entry_speed_kmh=float(np.mean(entries)) if entries else None,
+        mean_moving_approach_overspeed_fraction=float(np.mean([row['approach_overspeed_fraction'] for row in rows])),
+    )
+
+
 def evaluation_score(rows):
-    success = float(np.mean([row['is_success'] for row in rows]))
-    violations = float(np.mean([
-        row['red_light_violation'] or row['collision'] or row['out_of_road'] for row in rows
-    ]))
-    successful_times = [row['seconds'] for row in rows if row['is_success']]
-    mean_time = float(np.mean(successful_times)) if successful_times else EPISODE_SECONDS
-    overspeed = float(np.mean([row['approach_overspeed_fraction'] for row in rows]))
-    return success, -violations, -overspeed, -mean_time
+    summary = summarize_results(rows)
+    mean_time = summary['mean_success_seconds']
+    return (summary['success_rate'], -summary['unsafe_episodes'] / summary['episodes'],
+            -summary['mean_moving_approach_overspeed_fraction'],
+            -(EPISODE_SECONDS if mean_time is None else mean_time))
 
 
-# Training and evaluation
+def save_checkpoint(model, stage, completed, history, total_steps, rows, *paths):
+    model.completed_stages = completed.copy()
+    model.curriculum_history = history.copy()
+    model.training_env_steps = total_steps
+    model.selected_stage = stage
+    model.validation_results = rows
+    for path in paths:
+        model.save(str(path))
+
+
+# Training
 def train():
     if MODEL_PATH.exists() and not RESUME_TRAINING:
         raise FileExistsError('A model already exists. Set RESUME_TRAINING=True or choose another MODEL_PATH.')
@@ -650,24 +706,13 @@ def train():
                       f'Trained steps {total_steps:,}', flush=True)
                 if best_score is None or score > best_score:
                     best_score, best_rows = score, rows
-                    model.curriculum_history = history.copy()
-                    model.training_env_steps = total_steps
-                    model.completed_stages = completed.copy()
-                    model.selected_stage = stage
-                    model.validation_results = rows
-                    model.save(str(best_path))
-                    model.save(str(MODEL_PATH))
+                    save_checkpoint(model, stage, completed, history, total_steps, rows, best_path, MODEL_PATH)
                 if success >= STAGE_SUCCESS_TARGET and -score[2] <= MAX_APPROACH_OVERSPEED_FRACTION:
                     break
             model = PPO.load(str(best_path), device=DEVICE)
             if best_score[0] >= STAGE_SUCCESS_TARGET and -best_score[2] <= MAX_APPROACH_OVERSPEED_FRACTION and stage not in completed:
                 completed.append(stage)
-            model.completed_stages = completed.copy()
-            model.curriculum_history = history.copy()
-            model.training_env_steps = total_steps
-            model.selected_stage = stage
-            model.validation_results = best_rows
-            model.save(str(MODEL_PATH))
+            save_checkpoint(model, stage, completed, history, total_steps, best_rows, MODEL_PATH)
             print(f'Selected {stage} model saved: {MODEL_PATH}', flush=True)
             if stage != 'signals' and stage not in completed:
                 print(f'{stage} has not reached the stage target; keeping this stage for the next run.', flush=True)
@@ -675,6 +720,7 @@ def train():
     return model
 
 
+# Evaluation
 def evaluate(model, stage='signals', first_seed=TEST_START_SEED, episodes=TEST_EPISODES, verbose=True):
     env = SignalIntersectionEnv(render=RENDER_EVALUATION and verbose, stage=stage)
     results = []
@@ -692,27 +738,47 @@ def evaluate(model, stage='signals', first_seed=TEST_START_SEED, episodes=TEST_E
             if verbose:
                 print(f"{seed:7d} {info['outcome']:>12} {info['route_completion']:7.1%} "
                       f"{info['episode_reward']:9.2f} {info['seconds']:9.1f} {info['waiting_seconds']:9.1f}", flush=True)
-            elif len(results) % 50 == 0:
+            elif len(results) % VALIDATION_LOG_INTERVAL == 0:
                 print(f'Validation progress: {len(results)}/{episodes}', flush=True)
     finally:
         env.close()
     if not verbose:
         return results
-    for label, key in (('Successful arrival', 'is_success'), ('Red-light violations', 'red_light_violation'),
-                       ('Collisions', 'collision'), ('Road / route departures', 'out_of_road'), ('Timeouts', 'timeout')):
-        count = sum(row[key] for row in results)
+    summary = summarize_results(results)
+    for label, key in (('Successful arrival', 'successes'), ('Red-light violations', 'red_light_violations'),
+                       ('Collisions', 'collisions'), ('Road / route departures', 'out_of_road'), ('Timeouts', 'timeouts')):
+        count = summary[key]
         print(f'{label}: {count}/{len(results)} ({count / len(results):.1%})')
-    successful = [row['seconds'] for row in results if row['is_success']]
-    if successful:
-        print(f'Mean successful travel time: {np.mean(successful):.1f} s')
-    entries = [row['entry_speed_kmh'] for row in results if row['entry_speed_kmh'] is not None and row['is_success']]
-    if entries:
-        print(f'Mean successful entry speed: {np.mean(entries):.1f} km/h')
+    if summary['mean_success_seconds'] is not None:
+        print(f'Mean successful travel time: {summary["mean_success_seconds"]:.1f} s')
+    if summary['mean_success_entry_speed_kmh'] is not None:
+        print(f'Mean successful entry speed: {summary["mean_success_entry_speed_kmh"]:.1f} km/h')
     print(f'Mean moving-approach overspeed fraction (above {APPROACH_SPEED_KMH + SPEED_TOLERANCE_KMH:g} km/h): '
-          f'{np.mean([row["approach_overspeed_fraction"] for row in results]):.1%}')
+          f'{summary["mean_moving_approach_overspeed_fraction"]:.1%}')
     return results
 
 
+# Results
+def save_results(model, model_path, rows):
+    path = Path(model_path).resolve()
+    model_file = path.relative_to(PROJECT_DIR).as_posix() if path.is_relative_to(PROJECT_DIR) else path.as_posix()
+    episodes = [
+        {key: value.item() if isinstance(value, np.generic) else value for key, value in row.items()}
+        for row in rows
+    ]
+    result = dict(
+        model=dict(file=model_file, sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                   num_timesteps=int(model.num_timesteps)),
+        evaluation=dict(task=task_settings(), traffic_density=TRAFFIC_DENSITY, deterministic=True,
+                        seeds=[row['scenario_seed'] for row in episodes]),
+        summary=summarize_results(episodes), episodes=episodes,
+    )
+    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RESULTS_PATH.write_text(json.dumps(result, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+    print(f'Results: {RESULTS_PATH}')
+
+
+# Run
 def main():
     validate_settings()
     torch.set_num_threads(CPU_THREADS)
@@ -722,6 +788,7 @@ def main():
     if RUN_MODE == 'train':
         model.test_results = rows
         model.save(str(MODEL_PATH))
+    save_results(model, MODEL_PATH, rows)
 
 
 if __name__ == '__main__':
