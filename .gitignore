@@ -8,6 +8,11 @@ __pycache__/
 /.idea/
 /demo_outputs/
 
+# Keep only the selected model snapshots
+/models/*
+!/models/ppo_curve.zip
+!/models/ppo_yellow.zip
+
 # Local shortcuts and planning documents
 *.lnk
 ~$*
