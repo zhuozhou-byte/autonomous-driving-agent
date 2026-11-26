@@ -16,6 +16,7 @@ __pycache__/
 !/models/ppo_smooth_stop.zip
 !/models/ppo_smooth_refined.zip
 !/models/sac_signals.zip
+!/models/sac_dense_traffic.zip
 
 # Local shortcuts and planning documents
 *.lnk

@@ -2,6 +2,10 @@
 
 Replay a published checkpoint:
     python train_sac_signals.py --evaluate models/sac_signals.zip --scenario gaps
+Continue training:
+    python train_sac_signals.py --resume models/sac_signals.zip
+Refine speed on the straight after a joint left turn:
+    python train_sac_signals.py --train-exit models/sac_signals.zip
 """
 
 import argparse
@@ -31,6 +35,7 @@ try:
     from metadrive.envs import BaseEnv
     from metadrive.obs.observation_base import BaseObservation
     from stable_baselines3 import SAC
+    from stable_baselines3.sac.policies import Actor, SACPolicy
     from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 except ImportError:
     if __name__ == '__main__' and METADRIVE_PYTHON.is_file() and METADRIVE_PYTHON.resolve() != Path(sys.executable).resolve():
@@ -99,6 +104,20 @@ PROBE_HALF_WIDTH_S = 0.20
 
 # SAC and imitation learning
 TRAIN_SEED = 42
+RESUME_SEED = 73
+RESUME_ONLINE_STEPS = 12_000
+RESUME_DEMO_STEPS = 10_000
+RESUME_ACTOR_LR = 2e-5
+EXIT_CLEARANCE_M = 7.3
+EXIT_TARGET_SPEED_RATIO = 0.94
+EXIT_DEMO_GAIN = 0.55
+EXIT_SEED = 131
+EXIT_DEMO_SEEDS = (620_000, 650_000)
+EXIT_DEMO_STEPS = 6_000
+EXIT_CLONE_UPDATES = 750
+EXIT_CLONE_LR = 0.012
+EXIT_ACTOR_LR = 0.0002
+RESUME_GAP_LIMITS = (1.8, 0.8)  # Supplementary car-gap and walker-delay limits fitted on simulation probes (seconds).
 ONLINE_STEPS = 10_000
 DEMO_STEPS = 42_000
 CLONE_UPDATES = 6_000
@@ -557,20 +576,77 @@ class PedestrianObservation(JunctionObservation):
     size = 27
 
 
+def fits_turn_window(opposing_gap, walk_margin, limits):
+    allowed = (opposing_gap >= limits[0]) & (walk_margin <= limits[1])
+    if len(limits) == 4:
+        allowed = allowed | ((opposing_gap >= limits[2]) & (walk_margin <= limits[3]))
+    return allowed
+
+
 class GapFeatures(BaseFeaturesExtractor):
     """Append the gap decision learned from the two clearance margins."""
 
-    def __init__(self, observation_space, min_gap, max_walk_margin):
+    def __init__(self, observation_space, min_gap, max_walk_margin, extra_limits=None):
         super().__init__(observation_space, features_dim=observation_space.shape[0] + 1)
         self.min_gap = min_gap
         self.max_walk_margin = max_walk_margin
+        self.extra_limits = tuple(extra_limits or ())
 
     def forward(self, observations):
         joint = observations[:, 27:28] > 0.5
         opposing_gap = observations[:, 28:29] * 6.0
         walk_margin = observations[:, 29:30] * 2.5
-        opportunity = joint & (opposing_gap >= self.min_gap) & (walk_margin <= self.max_walk_margin)
+        limits = (self.min_gap, self.max_walk_margin) + getattr(self, 'extra_limits', ())
+        opportunity = joint & fits_turn_window(opposing_gap, walk_margin, limits)
         return torch.cat((observations, opportunity.to(observations.dtype)), dim=1)
+
+
+def exit_is_clear(obs):
+    """The car's rear has passed the painted exit crossing and the walker has cleared its lane."""
+    return (obs[..., 27] > 0.5) & (obs[..., 22] * 30 <= -EXIT_CLEARANCE_M) & (obs[..., 24] <= 0)
+
+
+class ExitThrottleActor(Actor):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.exit_throttle = torch.nn.Linear(1, 1)
+        torch.nn.init.zeros_(self.exit_throttle.weight)
+        torch.nn.init.zeros_(self.exit_throttle.bias)
+
+    def get_action_dist_params(self, obs):
+        mean, log_std, kwargs = super().get_action_dist_params(obs)
+        delta = self.exit_throttle(10.0 * (1.0 - obs[:, 2:3])) * exit_is_clear(obs).unsqueeze(1)
+        return torch.cat((mean[:, :1], mean[:, 1:] + delta), dim=1), log_std, kwargs
+
+
+class ExitThrottlePolicy(SACPolicy):
+    def make_actor(self, features_extractor=None):
+        kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor)
+        return ExitThrottleActor(**kwargs).to(self.device)
+
+
+def load_exit_model(checkpoint, env, seed):
+    """Resume SAC, adding the exit head on its first training stage."""
+    model = SAC.load(checkpoint, env=env, device='cpu', seed=seed)
+    previous = model.actor
+    if hasattr(previous, 'exit_throttle'):
+        return model
+    if model.observation_space.shape != (JunctionObservation.size,) or previous.latent_pi[0].in_features != 36:
+        raise ValueError('Exit training requires a calibrated 35-input signal checkpoint.')
+    actor = ExitThrottlePolicy.make_actor(model.policy)
+    state = actor.state_dict()
+    state.update(previous.state_dict())
+    actor.load_state_dict(state)
+    actor.set_training_mode(previous.training)
+    actor.optimizer = model.policy.optimizer_class(actor.parameters(), lr=previous.optimizer.param_groups[0]['lr'],
+                                                    **model.policy.optimizer_kwargs)
+    # The original parameters retain their order. Adam creates the new head's moments on its first step.
+    optimizer_state = previous.optimizer.state_dict()
+    optimizer_state['param_groups'][0]['params'] = actor.optimizer.state_dict()['param_groups'][0]['params']
+    actor.optimizer.load_state_dict(optimizer_state)
+    model.actor = model.policy.actor = actor
+    model.policy_class = ExitThrottlePolicy
+    return model
 
 
 def vehicle_corners(vehicle):
@@ -601,8 +677,7 @@ class YieldEncounter:
         return float(np.clip((slack + PROBE_HALF_WIDTH_S) / (2 * PROBE_HALF_WIDTH_S), 0.0, 1.0))
 
     def fits_gap(self, limits):
-        min_gap, max_walk_margin = limits
-        return self.initial_gap >= min_gap and self.initial_walk_margin <= max_walk_margin
+        return fits_turn_window(self.initial_gap, self.initial_walk_margin, limits)
 
     def distances(self):
         npc = self.env.opponent
@@ -1177,6 +1252,18 @@ def collect_corrections(env, model, rng, gap_limits):
     return torch.from_numpy(np.stack(states)), torch.from_numpy(np.stack(labels)), weights / weights.sum()
 
 
+def imitation_loss(actor, rng, demonstrations, corrections=None):
+    inputs, labels, groups = demonstrations
+    indices = np.concatenate([rng.choice(members, count) for members, count in groups])
+    states, targets = inputs[indices], labels[indices]
+    if corrections is not None:
+        visited, actions, weights = corrections
+        extra = rng.choice(len(weights), CORRECTIONS_PER_BATCH, p=weights)
+        states = torch.cat((states, visited[extra]))
+        targets = torch.cat((targets, actions[extra]))
+    return torch.nn.functional.mse_loss(actor(states, deterministic=True), targets)
+
+
 def train_agent(env, steps=ONLINE_STEPS, demos=DEMO_STEPS, seed=TRAIN_SEED, clone_updates=CLONE_UPDATES, checkpoint=None):
     if min(steps, demos, clone_updates) < 1:
         raise ValueError('Online steps, demonstration steps and cloning updates must be positive.')
@@ -1193,26 +1280,15 @@ def train_agent(env, steps=ONLINE_STEPS, demos=DEMO_STEPS, seed=TRAIN_SEED, clon
     model = SAC('MlpPolicy', env, **SAC_OPTIONS, buffer_size=max(MIN_REPLAY_SIZE, demos + steps + 4),
                 policy_kwargs=policy_kwargs, seed=seed, device='cpu', verbose=0)
     transfer_hook = extend_actor(model.actor, checkpoint) if checkpoint is not None else None
-    inputs, labels, groups = collect_demonstrations(env, model, demos, rng, gap_limits)
+    demonstrations = collect_demonstrations(env, model, demos, rng, gap_limits)
     corrections = None
-
-    def imitation_loss():
-        indices = np.concatenate([rng.choice(members, count) for members, count in groups])
-        batch_inputs, batch_labels = inputs[indices], labels[indices]
-        if corrections is not None:
-            extra_inputs, extra_labels, probabilities = corrections
-            extra = rng.choice(len(probabilities), CORRECTIONS_PER_BATCH, p=probabilities)
-            batch_inputs = torch.cat((batch_inputs, extra_inputs[extra]))
-            batch_labels = torch.cat((batch_labels, extra_labels[extra]))
-        predictions = model.actor(batch_inputs, deterministic=True)
-        return torch.nn.functional.mse_loss(predictions, batch_labels)
 
     optimizer = torch.optim.Adam(model.actor.parameters(), lr=EXTENSION_CLONE_LR if transfer_hook else CLONE_LR)
 
     def clone(updates):
         for _ in range(updates):
             optimizer.zero_grad()
-            imitation_loss().backward()
+            imitation_loss(model.actor, rng, demonstrations, corrections).backward()
             optimizer.step()
 
     clone(clone_updates)
@@ -1229,7 +1305,7 @@ def train_agent(env, steps=ONLINE_STEPS, demos=DEMO_STEPS, seed=TRAIN_SEED, clon
     # Add imitation gradients to the actor's existing SAC gradient before each optimizer step.
     def add_demo_gradient(optimizer, args, kwargs):
         with torch.enable_grad():
-            (DEMO_GRADIENT_WEIGHT * imitation_loss()).backward()
+            (DEMO_GRADIENT_WEIGHT * imitation_loss(model.actor, rng, demonstrations, corrections)).backward()
 
     model.get_env().seed(int(rng.integers(*ROLLOUT_SEEDS)))
     print(f'Cloning updates: {clone_updates}. Starting {steps} online SAC steps.', flush=True)
@@ -1241,6 +1317,124 @@ def train_agent(env, steps=ONLINE_STEPS, demos=DEMO_STEPS, seed=TRAIN_SEED, clon
         if transfer_hook is not None:
             transfer_hook.remove()
     print(f'Online SAC: {model.num_timesteps} steps, {model._n_updates} gradient updates.', flush=True)
+    return model
+
+
+def resume_agent(env, checkpoint, extra_limits=None, *, steps=RESUME_ONLINE_STEPS, demos=RESUME_DEMO_STEPS,
+                 seed=RESUME_SEED):
+    """Continue SAC from the calibrated checkpoint with a freshly populated replay buffer."""
+    if min(steps, demos) < 1:
+        raise ValueError('Continuation steps and demonstration steps must be positive.')
+    parent = SAC.load(checkpoint, device='cpu')
+    if hasattr(parent.actor, 'exit_throttle'):
+        del parent
+        return train_exit_speed(env, checkpoint, steps=steps)
+    if (parent.observation_space.shape != (JunctionObservation.size,)
+            or parent.actor.latent_pi[0].in_features != JunctionObservation.size + 1):
+        raise ValueError('--resume requires a calibrated signal checkpoint.')
+    kwargs = parent.policy_kwargs.copy()
+    features = dict(kwargs['features_extractor_kwargs'])
+    if extra_limits is not None and not features.get('extra_limits'):
+        features['extra_limits'] = tuple(extra_limits)
+    kwargs.update(features_extractor_class=GapFeatures, features_extractor_kwargs=features)
+    gap_limits = (features['min_gap'], features['max_walk_margin'], *(features.get('extra_limits') or ()))
+    model = SAC.load(checkpoint, env=env, device='cpu', seed=seed, custom_objects={'policy_kwargs': kwargs})
+    del parent
+
+    rng = np.random.default_rng(seed)
+    demonstrations = collect_demonstrations(env, model, demos, rng, gap_limits)
+    corrections = collect_corrections(env, model, rng, gap_limits)
+    first = model.actor.latent_pi[0].weight
+    model.actor.requires_grad_(False)
+    first.requires_grad_(True)
+    mask = torch.zeros_like(first)
+    mask[:, -1] = 1
+    optimizer = model.actor.optimizer
+    # Adam's stored momentum can otherwise update columns whose gradient is zero.
+    for moment in ('exp_avg', 'exp_avg_sq', 'max_exp_avg_sq'):
+        buffer = optimizer.state[first].get(moment)
+        if buffer is not None:
+            buffer[:, :-1].zero_()
+
+    def anchor_actor(optimizer, args, kwargs):
+        for group in optimizer.param_groups:
+            group['lr'] = RESUME_ACTOR_LR
+        with torch.enable_grad():
+            (DEMO_GRADIENT_WEIGHT * imitation_loss(model.actor, rng, demonstrations, corrections)).backward()
+
+    previous_steps, previous_updates = model.num_timesteps, model._n_updates
+    env.scenarios = np.random.default_rng(seed)
+    model.get_env().seed(int(rng.integers(*ROLLOUT_SEEDS)))
+    gradient_mask = first.register_hook(lambda gradient: gradient * mask)
+    anchor = optimizer.register_step_pre_hook(anchor_actor)
+    try:
+        model.learn(total_timesteps=steps, reset_num_timesteps=False)
+    finally:
+        anchor.remove()
+        gradient_mask.remove()
+    print(f'Continued SAC: {previous_steps} -> {model.num_timesteps} online steps, '
+          f'{previous_updates} -> {model._n_updates} gradient updates.', flush=True)
+    return model
+
+
+def train_exit_speed(env, checkpoint, steps=RESUME_ONLINE_STEPS):
+    """Optimize longitudinal control downstream of the crosswalk using the original SAC reward."""
+    rng = np.random.default_rng(EXIT_SEED)
+    model = load_exit_model(checkpoint, env, EXIT_SEED)
+    actor = model.actor
+    actor.requires_grad_(False)
+    actor.exit_throttle.requires_grad_(True)
+    states, targets = [], []
+    done = True
+    for _ in range(EXIT_DEMO_STEPS):
+        if done:
+            obs, _ = env.reset(seed=int(rng.integers(*EXIT_DEMO_SEEDS)))
+        action, _ = model.predict(obs, deterministic=True)
+        if exit_is_clear(obs):
+            target_speed = EXIT_TARGET_SPEED_RATIO * env.speed_limit
+            throttle = np.clip(EXIT_DEMO_GAIN * (target_speed - env.vehicle.speed), -1.0, 1.0)
+            states.append(obs)
+            targets.append(throttle)
+            action[1] = throttle
+        next_obs, reward, ended, truncated, info = env.step(action)
+        done = ended or truncated
+        info['TimeLimit.truncated'] = truncated and not ended
+        model.replay_buffer.add(obs[None], next_obs[None], model.policy.scale_action(action)[None],
+                                np.array([reward]), np.array([done]), [info])
+        obs = next_obs
+    if not states:
+        raise ValueError('Exit-speed training needs joint left turns with a clear crossing.')
+    inputs = torch.from_numpy(np.stack(states))
+    labels = torch.tensor(targets, dtype=torch.float32)
+
+    def exit_loss():
+        indices = rng.integers(len(labels), size=SAC_OPTIONS['batch_size'])
+        throttle = actor(inputs[indices], deterministic=True)[:, 1]
+        return torch.nn.functional.mse_loss(throttle, labels[indices])
+
+    clone = torch.optim.Adam(actor.exit_throttle.parameters(), lr=EXIT_CLONE_LR)
+    for _ in range(EXIT_CLONE_UPDATES):
+        clone.zero_grad()
+        exit_loss().backward()
+        clone.step()
+
+    def anchor_exit(optimizer, args, kwargs):
+        for group in optimizer.param_groups:
+            group['lr'] = EXIT_ACTOR_LR
+        with torch.enable_grad():
+            (DEMO_GRADIENT_WEIGHT * exit_loss()).backward()
+
+    print(f'Exit supervision: {len(states)} downstream states from {EXIT_DEMO_STEPS} replay steps.', flush=True)
+    previous_steps, previous_updates = model.num_timesteps, model._n_updates
+    env.scenarios = np.random.default_rng(EXIT_SEED)
+    model.get_env().seed(int(rng.integers(*ROLLOUT_SEEDS)))
+    hook = actor.optimizer.register_step_pre_hook(anchor_exit)
+    try:
+        model.learn(total_timesteps=steps, reset_num_timesteps=False)
+    finally:
+        hook.remove()
+    print(f'Exit SAC: {previous_steps} -> {model.num_timesteps} online steps, '
+          f'{previous_updates} -> {model._n_updates} gradient updates.', flush=True)
     return model
 
 
@@ -1311,6 +1505,9 @@ def main():
     mode.add_argument('--evaluate', type=Path, metavar='MODEL', help='Evaluate a saved SAC policy.')
     mode.add_argument('--extend', type=Path, metavar='MODEL',
                       help='Extend a vehicle (21), pedestrian (27) or joint (35) policy to the next traffic curriculum.')
+    mode.add_argument('--resume', type=Path, metavar='MODEL', help='Continue online SAC from a calibrated checkpoint.')
+    mode.add_argument('--train-exit', type=Path, metavar='MODEL', help='Refine throttle after clearing the exit crossing.')
+    parser.add_argument('--steps', type=int, help='Additional online steps for continuation, rounded up to a full rollout.')
     parser.add_argument('--render', action='store_true', help='Show the junction during evaluation.')
     parser.add_argument('--episodes', type=int, default=EVAL_EPISODES, help='Number of evaluation episodes.')
     parser.add_argument('--first-seed', type=int, default=EVAL_FIRST_SEED, help='First evaluation scenario seed.')
@@ -1318,12 +1515,14 @@ def main():
     parser.add_argument('--movement', choices=('mixed', 'straight', 'left'), help='Select the planned movement.')
     parser.add_argument('--scenario', choices=SCENARIOS, help='Select the signal and approach conditions.')
     args = parser.parse_args()
+    if args.steps is not None and (not (args.resume or args.train_exit) or args.steps < 1):
+        parser.error('--steps requires --resume or --train-exit and a positive step count.')
     if args.episodes < 1 or args.first_seed < 0 or args.first_seed + args.episodes > NUM_SCENARIOS:
         parser.error(f'Choose a positive episode count and seeds in [0, {NUM_SCENARIOS}).')
     if args.render and args.evaluate is None:
         parser.error('--render requires --evaluate MODEL.')
     left_only = ('pedestrians', 'joint', 'gaps', *LEFT_SCENARIOS)
-    if args.movement == 'straight' and (args.extend or args.scenario in left_only):
+    if args.movement == 'straight' and (args.extend or args.resume or args.train_exit or args.scenario in left_only):
         parser.error('This scenario requires --movement left or mixed.')
 
     torch.set_num_threads(1)
@@ -1349,7 +1548,17 @@ def main():
                     scenario=scenario, observation=observation, gap_curriculum=gap_curriculum)
     try:
         if model is None:
-            if base is None:
+            if args.resume is not None or args.train_exit is not None:
+                env.default_scenario = 'gaps'
+                try:
+                    steps = args.steps or RESUME_ONLINE_STEPS
+                    if args.train_exit is not None:
+                        model = train_exit_speed(env, args.train_exit, steps)
+                    else:
+                        model = resume_agent(env, args.resume, extra_limits=RESUME_GAP_LIMITS, steps=steps)
+                finally:
+                    env.default_scenario = scenario
+            elif base is None:
                 model = train_agent(env)
             else:
                 demos, clone_updates = EXTENSION_BUDGETS[base_size]
