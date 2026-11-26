@@ -14,13 +14,17 @@ RESUME_TRAINING = True
 MODEL_PATH = PROJECT_DIR / 'models' / 'ppo_yellow.zip'
 RESULTS_PATH = PROJECT_DIR / 'results' / 'ppo_yellow.json'
 RESUME_MODEL = None
-TRAINING_STAGES = (('green', 60_000), ('red_start', 100_000), ('signals', 102_400))
+RENDER_EVALUATION = False
+RANDOM_SEED = 42
+
+# Training and evaluation
+TRAINING_STAGES = (('green', 122_880), ('red_start', 122_880), ('signals', 204_800))
 VALIDATION_INTERVAL = 20_480
 VALIDATION_START_SEED = 2_000
 VALIDATION_EPISODES = 200
 STAGE_SUCCESS_TARGET = 1.0
-RENDER_EVALUATION = False
-RANDOM_SEED = 42
+CURRICULUM_SPEED_SUCCESS_TARGET = 0.99
+MIN_VALIDATION_SUCCESS_RATE = 0.98
 
 # Road
 MAP_SEED = 0
@@ -53,8 +57,6 @@ STOPPED_SPEED_KMH = 1.0
 # Scenarios
 TRAIN_START_SEED = 0
 TRAIN_SCENARIOS = 1_000
-TRAIN_FOCUS_SEEDS = ()
-TRAIN_FOCUS_PROBABILITY = 0.0
 TEST_START_SEED = 10_000
 TEST_EPISODES = 50
 
@@ -67,8 +69,9 @@ ROAD_DEPARTURE_PENALTY = 20.0
 TIMEOUT_PENALTY = 20.0
 TIME_COST_PER_SECOND = 0.2
 APPROACH_DISTANCE_M = 20.0
-APPROACH_SPEED_KMH = 20.0
-APPROACH_SPEED_PENALTY = 2.0
+APPROACH_SPEED_KMH = 30.0
+APPROACH_SPEED_PENALTY = 8.0
+ENTRY_SPEED_PENALTY_PER_KMH = 1.0
 BRAKING_RISK_PENALTY = 2.0
 BRAKING_DECELERATION = 3.0
 BRAKING_MARGIN_M = 1.0
@@ -133,9 +136,9 @@ OBSERVATION_NAMES = (
 )
 COLLISION_KEYS = ('crash_vehicle', 'crash_object', 'crash_building', 'crash_human', 'crash_sidewalk')
 TASK_VERSION = 'signal_intersection_v3'
+TRAINING_OBJECTIVE_KEYS = ('rewards', 'approach_speed')
 
 
-# Checks
 def validate_settings():
     if RUN_MODE not in ('train', 'evaluate'):
         raise ValueError("RUN_MODE must be 'train' or 'evaluate'.")
@@ -165,12 +168,14 @@ def validate_settings():
     validation_seeds = set(range(VALIDATION_START_SEED, VALIDATION_START_SEED + VALIDATION_EPISODES))
     if train_seeds & test_seeds or train_seeds & validation_seeds or test_seeds & validation_seeds:
         raise ValueError('Training, validation and test scenario seeds must be disjoint.')
-    if not 0 <= TRAIN_FOCUS_PROBABILITY <= 1 or not set(TRAIN_FOCUS_SEEDS) <= train_seeds:
-        raise ValueError('Focus probability must be in [0, 1], and focus seeds must belong to the training pool.')
     if not 0 < APPROACH_SPEED_KMH <= MAX_SPEED_KMH or APPROACH_DISTANCE_M <= 0:
         raise ValueError('Invalid approach speed or distance.')
     if BRAKING_DECELERATION <= 0 or BRAKING_MARGIN_M < 0:
         raise ValueError('Invalid braking parameters.')
+    if ENTRY_SPEED_PENALTY_PER_KMH < 0 or not 0 < MIN_VALIDATION_SUCCESS_RATE <= STAGE_SUCCESS_TARGET <= 1:
+        raise ValueError('Invalid entry penalty or validation success targets.')
+    if not 0 < CURRICULUM_SPEED_SUCCESS_TARGET <= STAGE_SUCCESS_TARGET:
+        raise ValueError('Invalid intermediate curriculum target.')
 
 
 def environment_config(render=False):
@@ -209,7 +214,7 @@ def environment_config(render=False):
 
 # Rewards
 def transition_reward(delta_progress, dt, waiting, collision, red_violation, off_road, success, timeout,
-                      approach_risk=0.0, braking_risk=0.0):
+                      approach_risk=0.0, braking_risk=0.0, entry_speed_kmh=None):
     events = (
         (collision, -COLLISION_PENALTY, 'collision'),
         (red_violation, -RED_LIGHT_PENALTY, 'red_light'),
@@ -219,10 +224,17 @@ def transition_reward(delta_progress, dt, waiting, collision, red_violation, off
     )
     for active, value, reason in events:
         if active:
+            if reason == 'success':
+                value -= entry_speed_cost(entry_speed_kmh)
             return float(value), reason
     reward = PROGRESS_REWARD * delta_progress - (0.0 if waiting else TIME_COST_PER_SECOND * dt)
     reward -= dt * (APPROACH_SPEED_PENALTY * approach_risk + BRAKING_RISK_PENALTY * braking_risk)
+    reward -= entry_speed_cost(entry_speed_kmh)
     return float(reward), 'running'
+
+
+def entry_speed_cost(speed_kmh):
+    return 0.0 if speed_kmh is None else ENTRY_SPEED_PENALTY_PER_KMH * max(0.0, speed_kmh - APPROACH_SPEED_KMH)
 
 
 def driving_risks(distance, speed, color, remaining, dt):
@@ -264,8 +276,6 @@ class SignalIntersectionEnv(gym.Wrapper):
             self.sampler = np.random.default_rng(seed)
         if seed is not None and not self.training:
             self.scenario_seed = int(seed)
-        elif self.training and TRAIN_FOCUS_SEEDS and self.sampler.random() < TRAIN_FOCUS_PROBABILITY:
-            self.scenario_seed = int(self.sampler.choice(TRAIN_FOCUS_SEEDS))
         else:
             self.scenario_seed = int(self.sampler.integers(TRAIN_START_SEED, TRAIN_START_SEED + TRAIN_SCENARIOS))
         rng = np.random.default_rng(self.scenario_seed)
@@ -295,6 +305,7 @@ class SignalIntersectionEnv(gym.Wrapper):
         self.approach_overspeed_steps = 0
         self.approach_peak_speed = 0.0
         self.entry_speed = None
+        self.entry_penalty = 0.0
         self.last_action = np.zeros(ACTION_SIZE)
         self.finished = False
         self.light = self.env.engine.spawn_object(
@@ -383,7 +394,8 @@ class SignalIntersectionEnv(gym.Wrapper):
         self.steps += 1
         current_distance = self.stop_distance()
         crossed = previous_distance >= 0 and current_distance < 0
-        if crossed:
+        first_entry = crossed and self.entry_speed is None
+        if first_entry:
             self.entry_speed = float(self.env.vehicle.speed_km_h)
         red_violation = bool(color_during_step == 'red' and crossed)
         collision = any(bool(native_info.get(key, False)) for key in COLLISION_KEYS)
@@ -396,7 +408,10 @@ class SignalIntersectionEnv(gym.Wrapper):
         reward, reason = transition_reward(
             self.route_progress() - previous_progress, self.dt, waiting,
             collision, red_violation, off_road, success, timeout, approach_risk, braking_risk,
+            self.entry_speed if first_entry else None,
         )
+        entry_penalty = entry_speed_cost(self.entry_speed) if first_entry and reason in ('running', 'success') else 0.0
+        self.entry_penalty += entry_penalty
         self.total_reward += reward
         self.wait_seconds += self.dt if waiting else 0.0
         self.finished = reason != 'running'
@@ -407,6 +422,7 @@ class SignalIntersectionEnv(gym.Wrapper):
         info['approach_risk'] = approach_risk
         info['braking_risk'] = braking_risk
         info['necessary_wait'] = waiting
+        info['step_entry_speed_penalty'] = entry_penalty
         if self.env.config['use_render']:
             self.render()
         # Observed task deadline
@@ -424,6 +440,7 @@ class SignalIntersectionEnv(gym.Wrapper):
             episode_length=self.steps, seconds=self.steps * self.dt, waiting_seconds=self.wait_seconds,
             approach_overspeed_fraction=self.approach_overspeed_steps / max(1, self.approach_steps),
             approach_peak_speed_kmh=self.approach_peak_speed, entry_speed_kmh=self.entry_speed,
+            entry_speed_penalty=self.entry_penalty,
         )
 
     def _draw_stop_line(self):
@@ -457,10 +474,11 @@ class SignalIntersectionEnv(gym.Wrapper):
         self.env.close()
 
 
-# Output
 def print_reward_table():
     rows = (
         ('Route progress', f'{PROGRESS_REWARD:g} * progress change'),
+        ('Approach target speed', f'{APPROACH_SPEED_KMH:g} km/h'),
+        ('Entry speed above target (once)', f'-{ENTRY_SPEED_PENALTY_PER_KMH:g} / excess km/h'),
         ('Successful arrival', f'+{SUCCESS_REWARD:g}'),
         ('Red-light violation', f'-{RED_LIGHT_PENALTY:g}'),
         ('Collision', f'-{COLLISION_PENALTY:g}'),
@@ -516,7 +534,8 @@ def task_settings():
         rewards=dict(progress=PROGRESS_REWARD, success=SUCCESS_REWARD, red=RED_LIGHT_PENALTY,
                      collision=COLLISION_PENALTY, departure=ROAD_DEPARTURE_PENALTY,
                      timeout=TIMEOUT_PENALTY, time_cost=TIME_COST_PER_SECOND,
-                     approach=APPROACH_SPEED_PENALTY, braking=BRAKING_RISK_PENALTY),
+                     approach=APPROACH_SPEED_PENALTY, braking=BRAKING_RISK_PENALTY,
+                     entry_speed_per_kmh=ENTRY_SPEED_PENALTY_PER_KMH),
     )
 
 
@@ -532,65 +551,27 @@ def ppo_settings(stage='signals'):
     )
 
 
-def load_model(env=None, stage='signals', for_training=False, path=None):
+def load_model(path=None, for_training=False):
     path = Path(path) if path is not None else MODEL_PATH
     if not path.is_file():
         raise FileNotFoundError(f'Model not found: {path}')
-    overrides = ppo_settings(stage) if env is not None or for_training else {}
+    overrides = ppo_settings() if for_training else {}
     model = PPO.load(str(path), device=DEVICE, **overrides)
     if not hasattr(model, 'policy_training_rewards'):
         model.policy_training_rewards = dict(getattr(model, 'intersection_settings', {}).get('rewards', {}))
-    model.transferred_this_run = False
     if getattr(model, 'intersection_settings', None) != task_settings():
         previous = getattr(model, 'intersection_settings', {})
         current = task_settings()
-        same_task = {k: v for k, v in previous.items() if k != 'rewards'} == {
-            k: v for k, v in current.items() if k != 'rewards'
+        same_task = {k: v for k, v in previous.items() if k not in TRAINING_OBJECTIVE_KEYS} == {
+            k: v for k, v in current.items() if k not in TRAINING_OBJECTIVE_KEYS
         }
         if for_training and same_task:
+            model.previous_task_settings = previous
             model.previous_reward_settings = previous['rewards']
             model.intersection_settings = current
-            print('Continuing the same task with updated reward weights.', flush=True)
-        elif for_training and previous.get('version') == 'signal_intersection_v2':
-            model = transfer_yellow_policy(model, stage)
+            print('Continuing the same task with updated reward settings.', flush=True)
         else:
             raise ValueError('The checkpoint uses different task settings. Match its settings before loading it.')
-    if env is not None:
-        model.set_env(env)
-    return model
-
-
-# Observation transfer
-def transfer_yellow_policy(source, stage):
-    previous = source.intersection_settings
-    current = task_settings()
-    if previous['observations'] != list(OBSERVATION_NAMES[:-1]):
-        raise ValueError('Unexpected source observations.')
-    for name, value in previous.items():
-        if name not in ('version', 'observations', 'rewards') and current.get(name) != value:
-            raise ValueError(f'Source task differs in {name}.')
-    for name, value in previous['rewards'].items():
-        if current['rewards'].get(name) != value:
-            raise ValueError(f'Source reward differs in {name}.')
-    env = SignalIntersectionEnv(stage=stage)
-    try:
-        model = PPO('MlpPolicy', env, **ppo_settings(stage), seed=RANDOM_SEED, device=DEVICE, verbose=0)
-        weights = source.policy.state_dict()
-        for key in ('mlp_extractor.policy_net.0.weight', 'mlp_extractor.value_net.0.weight'):
-            weights[key] = torch.cat((weights[key], torch.zeros_like(weights[key][:, :1])), dim=1)
-        model.policy.load_state_dict(weights)
-        model.policy.reset_noise()
-    finally:
-        env.close()
-    model.intersection_settings = current
-    model.num_timesteps = source.num_timesteps
-    model.training_env_steps = getattr(source, 'training_env_steps', source.num_timesteps)
-    model.completed_stages = [s for s in getattr(source, 'completed_stages', []) if s != 'signals']
-    model.curriculum_history = []
-    model.source_task_version = previous['version']
-    model.policy_training_rewards = dict(previous['rewards'])
-    model.transferred_this_run = True
-    print('Transferred driving weights; added one yellow-light input; reset optimizer.', flush=True)
     return model
 
 
@@ -601,6 +582,7 @@ def summarize_results(rows):
     successful = [row for row in rows if row['is_success']]
     times = [row['seconds'] for row in successful]
     entries = [row['entry_speed_kmh'] for row in successful if row['entry_speed_kmh'] is not None]
+    compliant = sum(speed <= APPROACH_SPEED_KMH + SPEED_TOLERANCE_KMH for speed in entries)
     return dict(
         episodes=len(rows), successes=len(successful), success_rate=len(successful) / len(rows),
         red_light_violations=sum(row['red_light_violation'] for row in rows),
@@ -612,6 +594,9 @@ def summarize_results(rows):
         mean_reward=float(np.mean([row['episode_reward'] for row in rows])),
         mean_success_seconds=float(np.mean(times)) if times else None,
         mean_success_entry_speed_kmh=float(np.mean(entries)) if entries else None,
+        speed_compliant_successes=compliant,
+        speed_compliant_success_rate=compliant / len(rows),
+        mean_success_entry_excess_kmh=float(np.mean([max(0.0, speed - APPROACH_SPEED_KMH) for speed in entries])) if entries else None,
         mean_moving_approach_overspeed_fraction=float(np.mean([row['approach_overspeed_fraction'] for row in rows])),
     )
 
@@ -619,9 +604,23 @@ def summarize_results(rows):
 def evaluation_score(rows):
     summary = summarize_results(rows)
     mean_time = summary['mean_success_seconds']
-    return (summary['success_rate'], -summary['unsafe_episodes'] / summary['episodes'],
+    acceptable = (summary['success_rate'] >= MIN_VALIDATION_SUCCESS_RATE
+                  and summary['collisions'] == 0 and summary['out_of_road'] == 0)
+    quality = summary['speed_compliant_success_rate'] if acceptable else summary['success_rate']
+    excess = summary['mean_success_entry_excess_kmh']
+    return (acceptable, quality, -summary['unsafe_episodes'] / summary['episodes'], summary['success_rate'],
+            -(MAX_SPEED_KMH if excess is None else excess),
             -summary['mean_moving_approach_overspeed_fraction'],
             -(EPISODE_SECONDS if mean_time is None else mean_time))
+
+
+def stage_target_met(rows, stage='signals'):
+    summary = summarize_results(rows)
+    speed_target = STAGE_SUCCESS_TARGET if stage == 'signals' else CURRICULUM_SPEED_SUCCESS_TARGET
+    return (summary['success_rate'] >= STAGE_SUCCESS_TARGET
+            and summary['speed_compliant_success_rate'] >= speed_target
+            and summary['collisions'] == 0 and summary['out_of_road'] == 0
+            and summary['mean_moving_approach_overspeed_fraction'] <= MAX_APPROACH_OVERSPEED_FRACTION)
 
 
 def save_checkpoint(model, stage, completed, history, total_steps, rows, *paths):
@@ -645,8 +644,13 @@ def train():
     total_steps = int(getattr(model, 'training_env_steps', 0))
     print('Driver: self-trained SB3 PPO; steering and throttle/brake are learned.', flush=True)
     print('Curriculum: green -> red_start -> signals. Final evaluation always uses signals.', flush=True)
-    if model is not None and getattr(model, 'transferred_this_run', False):
-        print('\nSource policy on the new yellow-light task:', flush=True)
+    if model is not None:
+        model.training_run_throttle_noise_scale = 1.0
+        model.training_run_throttle_bias_shift = 0.0
+        model.training_run_start_steps = total_steps
+        model.training_run_start_policy_steps = model.num_timesteps
+        model.training_run_source_sha256 = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+        print('\nSource policy with current reward settings:', flush=True)
         model.baseline_test_results = evaluate(model)
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='intersection_curriculum_') as temporary:
@@ -662,12 +666,20 @@ def train():
                 best_score = evaluation_score(best_rows)
                 print(f'Starting validation {stage}: {sum(row["is_success"] for row in best_rows)}/{len(best_rows)}', flush=True)
                 model.save(str(best_path))
+                if stage != 'signals' and stage_target_met(best_rows, stage):
+                    completed.append(stage)
+                    save_checkpoint(model, stage, completed, history, total_steps, best_rows, MODEL_PATH)
+                    print(f'{stage} already meets the intermediate target; advancing.', flush=True)
+                    continue
             while stage_steps < budget:
                 env = Monitor(SignalIntersectionEnv(training=True, stage=stage))
                 env.env.sampler = np.random.default_rng(RANDOM_SEED + total_steps)
                 try:
                     if model is None:
                         model = PPO('MlpPolicy', env, **ppo_settings(stage), seed=RANDOM_SEED, device=DEVICE, verbose=0)
+                        model.training_run_start_steps = 0
+                        model.training_run_start_policy_steps = 0
+                        model.training_run_source_sha256 = None
                         with torch.no_grad():
                             model.policy.log_std[:, 0].fill_(STEERING_LOG_STD)
                             model.policy.log_std[:, 1].fill_(THROTTLE_LOG_STD)
@@ -680,8 +692,6 @@ def train():
                         model.lr_schedule = lambda _: rate
                     model.intersection_settings = task_settings()
                     model.training_scenario_seeds = (TRAIN_START_SEED, TRAIN_START_SEED + TRAIN_SCENARIOS - 1)
-                    model.training_focus_seeds = list(TRAIN_FOCUS_SEEDS)
-                    model.training_focus_probability = TRAIN_FOCUS_PROBABILITY
                     model.resume_source = str(source_path) if RESUME_TRAINING else None
                     before = model.num_timesteps
                     chunk = min(VALIDATION_INTERVAL, budget - stage_steps)
@@ -693,24 +703,36 @@ def train():
                 finally:
                     env.close()
                 rows = evaluate(model, stage, VALIDATION_START_SEED, VALIDATION_EPISODES, verbose=False)
-                success = float(np.mean([row['is_success'] for row in rows]))
+                summary = summarize_results(rows)
+                success = summary['success_rate']
+                overspeed = summary['mean_moving_approach_overspeed_fraction']
                 score = evaluation_score(rows)
-                history.append(dict(stage=stage, selected_step=model.num_timesteps,
+                history.append(dict(stage=stage, candidate_step=model.num_timesteps,
                                     trained_steps=total_steps, success=success, validation_count=len(rows),
-                                    approach_weight=APPROACH_SPEED_PENALTY, overspeed_fraction=-score[2]))
+                                    approach_target_kmh=APPROACH_SPEED_KMH,
+                                    approach_weight=APPROACH_SPEED_PENALTY,
+                                    entry_weight=ENTRY_SPEED_PENALTY_PER_KMH,
+                                    compliant_success_rate=summary['speed_compliant_success_rate'],
+                                    overspeed_fraction=overspeed))
+                entry_speed = summary['mean_success_entry_speed_kmh']
+                entry_text = 'N/A' if entry_speed is None else f'{entry_speed:.1f} km/h'
+                mean_time = summary['mean_success_seconds']
+                time_text = 'N/A' if mean_time is None else f'{mean_time:.1f}s'
                 print(f'Validation {stage}: {sum(row["is_success"] for row in rows)}/{len(rows)} | '
                       f'Red {sum(row["red_light_violation"] for row in rows)} | '
                       f'Off-road {sum(row["out_of_road"] for row in rows)} | '
                       f'Timeout {sum(row["timeout"] for row in rows)} | '
-                      f'Approach overspeed {-score[2]:.1%} | Mean successful time {-score[3]:.1f}s | '
+                      f'Approach overspeed {overspeed:.1%} | Mean successful time {time_text} | '
+                      f'Compliant arrivals {summary["speed_compliant_successes"]}/{len(rows)} | '
+                      f'Entry speed {entry_text} | '
                       f'Trained steps {total_steps:,}', flush=True)
                 if best_score is None or score > best_score:
                     best_score, best_rows = score, rows
                     save_checkpoint(model, stage, completed, history, total_steps, rows, best_path, MODEL_PATH)
-                if success >= STAGE_SUCCESS_TARGET and -score[2] <= MAX_APPROACH_OVERSPEED_FRACTION:
+                if stage_target_met(rows, stage):
                     break
             model = PPO.load(str(best_path), device=DEVICE)
-            if best_score[0] >= STAGE_SUCCESS_TARGET and -best_score[2] <= MAX_APPROACH_OVERSPEED_FRACTION and stage not in completed:
+            if stage_target_met(best_rows, stage) and stage not in completed:
                 completed.append(stage)
             save_checkpoint(model, stage, completed, history, total_steps, best_rows, MODEL_PATH)
             print(f'Selected {stage} model saved: {MODEL_PATH}', flush=True)
@@ -745,6 +767,8 @@ def evaluate(model, stage='signals', first_seed=TEST_START_SEED, episodes=TEST_E
     if not verbose:
         return results
     summary = summarize_results(results)
+    print(f'Successful arrivals at or below {APPROACH_SPEED_KMH + SPEED_TOLERANCE_KMH:g} km/h: '
+          f'{summary["speed_compliant_successes"]}/{len(results)}')
     for label, key in (('Successful arrival', 'successes'), ('Red-light violations', 'red_light_violations'),
                        ('Collisions', 'collisions'), ('Road / route departures', 'out_of_road'), ('Timeouts', 'timeouts')):
         count = summary[key]
@@ -773,12 +797,27 @@ def save_results(model, model_path, rows):
                         seeds=[row['scenario_seed'] for row in episodes]),
         summary=summarize_results(episodes), episodes=episodes,
     )
+    if hasattr(model, 'training_run_start_steps'):
+        result['training'] = dict(
+            attempted_steps=model.training_env_steps - model.training_run_start_steps,
+            total_attempted_steps=model.training_env_steps,
+            source_policy_steps=model.training_run_start_policy_steps,
+            source_sha256=model.training_run_source_sha256,
+            selected_from_last_run=model.num_timesteps > model.training_run_start_policy_steps,
+            initialization='checkpoint' if model.training_run_source_sha256 else 'random',
+            throttle_noise_scale=getattr(model, 'training_run_throttle_noise_scale', 1.0),
+            throttle_bias_shift=getattr(model, 'training_run_throttle_bias_shift', 0.0),
+        )
+    if getattr(model, 'baseline_test_results', None):
+        result['baseline_summary'] = summarize_results(model.baseline_test_results)
+    if getattr(model, 'validation_results', None):
+        result['validation_stage'] = model.selected_stage
+        result['validation_summary'] = summarize_results(model.validation_results)
     RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     RESULTS_PATH.write_text(json.dumps(result, indent=2, allow_nan=False) + '\n', encoding='utf-8')
     print(f'Results: {RESULTS_PATH}')
 
 
-# Run
 def main():
     validate_settings()
     torch.set_num_threads(CPU_THREADS)
