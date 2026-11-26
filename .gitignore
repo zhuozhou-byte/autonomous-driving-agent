@@ -12,6 +12,7 @@ __pycache__/
 /models/*
 !/models/ppo_curve.zip
 !/models/ppo_yellow.zip
+!/models/sac_signals.zip
 
 # Local shortcuts and planning documents
 *.lnk

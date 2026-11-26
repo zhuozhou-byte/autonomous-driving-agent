@@ -1,0 +1,201 @@
+{
+  "model": {
+    "file": "models/sac_signals.zip",
+    "sha256": "7ec161791cf4af85fe4f923565a718c75d634799e1b7affeea9f5c540323e2c6",
+    "checkpoint": "20261125_190521_668711",
+    "algorithm": "Stable-Baselines3 SAC",
+    "num_timesteps": 8000,
+    "training_stage": {
+      "parent_checkpoint": "20261125_185257_281463",
+      "demonstration_steps": 34000,
+      "initial_imitation_updates": 6500,
+      "correction_updates": 1200,
+      "online_sac_steps": 8000,
+      "online_sac_gradient_updates": 2000
+    },
+    "observation_dimensions": 35,
+    "controls": [
+      "steering",
+      "throttle_brake"
+    ],
+    "calibrated_min_opposing_gap_seconds": 0.9,
+    "calibrated_max_pedestrian_braking_delay_seconds": -0.4
+  },
+  "evaluation": {
+    "date": "2026-11-25",
+    "task": "MetaDrive simulated four-arm junction with SUMO traffic lights",
+    "rules_reference": "https://www.ontario.ca/document/official-mto-drivers-handbook/driving-through-intersections",
+    "network": "sumo_signal.net.xml",
+    "entrypoint": "train_sac_signals.py",
+    "deterministic": true,
+    "versions": {
+      "metadrive-simulator": "0.4.3",
+      "stable-baselines3": "2.9.2",
+      "torch": "2.15.0",
+      "sumo": "SUMO 1.28.0"
+    },
+    "protocol": {
+      "joint": {
+        "first_seed": 73280,
+        "last_seed": 73327,
+        "episodes_per_scenario": 48,
+        "scenarios": [
+          "joint-near-busy",
+          "joint-near-clear",
+          "joint-far-busy",
+          "joint-far-clear",
+          "joint-varied",
+          "joint-mid-open",
+          "joint-mid-busy"
+        ]
+      },
+      "single": {
+        "first_seed": 76000,
+        "last_seed": 76127,
+        "episodes": 128,
+        "scenario": "single"
+      },
+      "command_template": "python train_sac_signals.py --evaluate models/sac_signals.zip --scenario {scenario} --first-seed {first_seed} --episodes {count}",
+      "strict_compliance": "Route completed without speeding, traffic-signal or yielding violations, lane departure, wrong-way travel, collision or timeout.",
+      "clearance": "Elapsed seconds from first vehicle leaving the shared zone to the second vehicle entering it. Pedestrian clearance is measured from the walker leaving the exit lane to the ego vehicle entering the crosswalk."
+    }
+  },
+  "summary": {
+    "episodes": 464,
+    "compliant": 464,
+    "joint_compliant": 336,
+    "single_compliant": 128,
+    "violations": {
+      "red_violation": 0,
+      "yellow_violation": 0,
+      "yield_violation": 0,
+      "ped_violation": 0,
+      "ped_collision": 0,
+      "had_overspeed": 0,
+      "out_of_lane": 0,
+      "wrong_way": 0,
+      "collision": 0,
+      "timeout": 0
+    }
+  },
+  "scenarios": {
+    "joint-near-busy": {
+      "episodes": 48,
+      "arrived": 48,
+      "compliant": 48,
+      "median_compliant_trip_seconds": 20.7,
+      "conflict_order": {
+        "oncoming-first": 48
+      },
+      "minimum_ego_first_clearance_seconds": null,
+      "minimum_oncoming_first_clearance_seconds": 1.629,
+      "minimum_pedestrian_clearance_seconds": 1.402
+    },
+    "joint-near-clear": {
+      "episodes": 48,
+      "arrived": 48,
+      "compliant": 48,
+      "median_compliant_trip_seconds": 19.4,
+      "conflict_order": {
+        "oncoming-first": 48
+      },
+      "minimum_ego_first_clearance_seconds": null,
+      "minimum_oncoming_first_clearance_seconds": 1.629,
+      "minimum_pedestrian_clearance_seconds": 7.528
+    },
+    "joint-far-busy": {
+      "episodes": 48,
+      "arrived": 48,
+      "compliant": 48,
+      "median_compliant_trip_seconds": 24.8,
+      "conflict_order": {
+        "oncoming-first": 48
+      },
+      "minimum_ego_first_clearance_seconds": null,
+      "minimum_oncoming_first_clearance_seconds": 1.613,
+      "minimum_pedestrian_clearance_seconds": 4.265
+    },
+    "joint-far-clear": {
+      "episodes": 48,
+      "arrived": 48,
+      "compliant": 48,
+      "median_compliant_trip_seconds": 15.6,
+      "conflict_order": {
+        "ego-first": 48
+      },
+      "minimum_ego_first_clearance_seconds": 3.05,
+      "minimum_oncoming_first_clearance_seconds": null,
+      "minimum_pedestrian_clearance_seconds": 3.799
+    },
+    "joint-varied": {
+      "episodes": 48,
+      "arrived": 48,
+      "compliant": 48,
+      "median_compliant_trip_seconds": 21.6,
+      "conflict_order": {
+        "oncoming-first": 48
+      },
+      "minimum_ego_first_clearance_seconds": null,
+      "minimum_oncoming_first_clearance_seconds": 1.625,
+      "minimum_pedestrian_clearance_seconds": 3.912
+    },
+    "joint-mid-open": {
+      "episodes": 48,
+      "arrived": 48,
+      "compliant": 48,
+      "median_compliant_trip_seconds": 22.7,
+      "conflict_order": {
+        "oncoming-first": 37,
+        "ego-first": 11
+      },
+      "minimum_ego_first_clearance_seconds": 1.664,
+      "minimum_oncoming_first_clearance_seconds": 1.495,
+      "minimum_pedestrian_clearance_seconds": 2.255
+    },
+    "joint-mid-busy": {
+      "episodes": 48,
+      "arrived": 48,
+      "compliant": 48,
+      "median_compliant_trip_seconds": 22.8,
+      "conflict_order": {
+        "oncoming-first": 48
+      },
+      "minimum_ego_first_clearance_seconds": null,
+      "minimum_oncoming_first_clearance_seconds": 1.63,
+      "minimum_pedestrian_clearance_seconds": 4.904
+    },
+    "single": {
+      "episodes": 128,
+      "arrived": 128,
+      "compliant": 128,
+      "median_compliant_trip_seconds": 20.4,
+      "conflict_order": {
+        "oncoming-first": 23,
+        "ego-first": 13
+      },
+      "minimum_ego_first_clearance_seconds": 2.568,
+      "minimum_oncoming_first_clearance_seconds": 1.428,
+      "minimum_pedestrian_clearance_seconds": 1.288
+    }
+  },
+  "paired_mid_open_comparison": {
+    "previous_checkpoint": "20261125_185257_281463",
+    "previous_sha256": "8a4064f7b34cf0fdaec013f45e5cc2ef708d81c3ca91959fa522e16a7ce052f4",
+    "previous": {
+      "episodes": 48,
+      "arrived": 48,
+      "compliant": 48,
+      "median_compliant_trip_seconds": 23.0,
+      "conflict_order": {
+        "oncoming-first": 48
+      },
+      "minimum_ego_first_clearance_seconds": null,
+      "minimum_oncoming_first_clearance_seconds": 1.323,
+      "minimum_pedestrian_clearance_seconds": 8.255
+    },
+    "old_wait_new_go_compliant_pairs": 11,
+    "switched_pairs_median_seconds_saved": 7.8,
+    "switched_pairs_minimum_vehicle_clearance_seconds": 1.664,
+    "switched_pairs_minimum_pedestrian_clearance_seconds": 2.255
+  }
+}
