@@ -12,6 +12,9 @@ __pycache__/
 /models/*
 !/models/ppo_curve.zip
 !/models/ppo_yellow.zip
+!/models/ppo_exit_recovery.zip
+!/models/ppo_smooth_stop.zip
+!/models/ppo_smooth_refined.zip
 !/models/sac_signals.zip
 
 # Local shortcuts and planning documents
